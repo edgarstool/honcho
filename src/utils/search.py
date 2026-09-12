@@ -5,6 +5,7 @@ RRF is a method to combine multiple ranked lists by computing the reciprocal
 of each item's rank in each list, then summing these reciprocal ranks.
 """
 
+import logging
 import re
 from typing import Any, TypeVar
 
@@ -24,6 +25,7 @@ from src.utils.types import embedding_call_purpose
 from src.vector_store import get_external_vector_store
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 def _uses_pgvector_message_search() -> bool:
@@ -392,14 +394,28 @@ async def search(
             raise ValidationException(
                 f"Query exceeds maximum token limit of {settings.EMBEDDING.MAX_INPUT_TOKENS}."
             ) from e
-
-        if not _uses_pgvector_message_search():
-            semantic_message_ids = await query_external_vector_message_ids(
-                workspace_name=workspace_name,
-                embedding_query=query_embedding,
-                limit=semantic_limit,
-                filters=filters,
+        except Exception:
+            logger.warning(
+                "Semantic embedding unavailable; falling back to full-text search",
+                exc_info=True,
             )
+            query_embedding = None
+
+        if query_embedding is not None and not _uses_pgvector_message_search():
+            try:
+                semantic_message_ids = await query_external_vector_message_ids(
+                    workspace_name=workspace_name,
+                    embedding_query=query_embedding,
+                    limit=semantic_limit,
+                    filters=filters,
+                )
+            except Exception:
+                logger.warning(
+                    "External vector search unavailable; falling back to full-text search",
+                    exc_info=True,
+                )
+                query_embedding = None
+                semantic_message_ids = None
 
     async def _run_search(active_db: AsyncSession) -> list[models.Message]:
         search_results: list[list[models.Message]] = []
@@ -409,30 +425,36 @@ async def search(
             and isinstance(workspace_name, str)
             and query_embedding is not None
         ):
-            if _uses_pgvector_message_search():
-                semantic_results = await _semantic_search_pgvector(
-                    db=active_db,
-                    workspace_name=workspace_name,
-                    embedding_query=query_embedding,
-                    limit=semantic_limit,
-                    filters=filters,
-                )
-            else:
-                semantic_results = await fetch_messages_by_ids(
-                    db=active_db,
-                    message_ids=semantic_message_ids or [],
-                    filters=filters,
-                )
+            try:
+                if _uses_pgvector_message_search():
+                    semantic_results = await _semantic_search_pgvector(
+                        db=active_db,
+                        workspace_name=workspace_name,
+                        embedding_query=query_embedding,
+                        limit=semantic_limit,
+                        filters=filters,
+                    )
+                else:
+                    semantic_results = await fetch_messages_by_ids(
+                        db=active_db,
+                        message_ids=semantic_message_ids or [],
+                        filters=filters,
+                    )
 
-            if peer_perspective_name:
-                semantic_results = await _filter_by_peer_perspective(
-                    active_db,
-                    semantic_results,
-                    workspace_name,
-                    peer_perspective_name,
-                )
+                if peer_perspective_name:
+                    semantic_results = await _filter_by_peer_perspective(
+                        active_db,
+                        semantic_results,
+                        workspace_name,
+                        peer_perspective_name,
+                    )
 
-            search_results.append(semantic_results)
+                search_results.append(semantic_results)
+            except Exception:
+                logger.warning(
+                    "Semantic vector search unavailable; falling back to full-text search",
+                    exc_info=True,
+                )
 
         fulltext_results = await _fulltext_search(
             db=active_db,

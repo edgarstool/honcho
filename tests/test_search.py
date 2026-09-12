@@ -704,3 +704,36 @@ async def test_grep_messages_observer_scoping_left_session_still_visible(
     matched_ids = [m.public_id for matches, _ in results for m in matches]
     assert msg_during.public_id in matched_ids
     assert msg_after.public_id in matched_ids
+
+
+@pytest.mark.asyncio
+async def test_search_falls_back_to_fulltext_when_embedding_provider_unavailable(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = models.Workspace(name=generate_nanoid())
+    peer = models.Peer(name="fallback-peer", workspace_name=workspace.name)
+    session = models.Session(name="fallback-session", workspace_name=workspace.name)
+    db_session.add_all([workspace, peer, session])
+    await db_session.flush()
+
+    marker = f"provider-fallback-{generate_nanoid()}"
+    message = models.Message(
+        content=f"Knowledge fallback canary {marker}",
+        session_name=session.name,
+        peer_name=peer.name,
+        workspace_name=workspace.name,
+        seq_in_session=1,
+    )
+    db_session.add(message)
+    await db_session.commit()
+
+    async def fail_embedding(_: str):
+        raise RuntimeError("embedding provider unavailable")
+
+    monkeypatch.setattr("src.utils.search.embedding_client.embed", fail_embedding)
+
+    results = await search(
+        marker, filters={"workspace_id": workspace.name}, limit=5
+    )
+
+    assert message.public_id in [item.public_id for item in results]
