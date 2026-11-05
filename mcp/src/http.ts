@@ -11,6 +11,16 @@ import {
   type HonchoConfig,
   sentryOptions,
 } from "./config.js";
+import {
+  guardToolContext,
+  looksLikeJwt,
+  oauthHonchoConfig,
+  OAuthError,
+  parseOAuthSettings,
+  verifyAccessToken,
+  type OAuthIdentity,
+  type OAuthSettings,
+} from "./oauth.js";
 import { createServer } from "./server.js";
 import { invalidTokenResponse, type ToolContext } from "./types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -49,6 +59,14 @@ type Session = {
   server: McpServer;
   lastSeen: number;
   apiKey: string;
+  /**
+   * The raw bearer token this session was opened with. Compared on every
+   * request: a session may not be reused with different credentials, whether
+   * that is a different Honcho key or a different OAuth access token (in
+   * OAuth mode `apiKey` is the shared server-side key, so it cannot serve
+   * this purpose).
+   */
+  credential: string;
   /**
    * Set by a tool once the Honcho API rejects this session's access token.
    * A session is bound to one token, so it stays set.
@@ -97,6 +115,12 @@ function envBindings(): Env {
 }
 
 function authorizationServer(): string {
+  try {
+    const settings = parseOAuthSettings();
+    if (settings.enabled) return settings.issuer;
+  } catch {
+    // Fall through to the Honcho-hosted default below.
+  }
   return process.env.HONCHO_API_URL?.trim() || "https://api.honcho.dev";
 }
 
@@ -140,6 +164,100 @@ function configOrUnauthorized(request: Request): HonchoConfig | Response {
   }
 }
 
+/** What one request's bearer token resolved to. */
+type RequestAuth =
+  | { kind: "native"; config: HonchoConfig; credential: string }
+  | {
+      kind: "oauth";
+      config: HonchoConfig;
+      identity: OAuthIdentity;
+      credential: string;
+    };
+
+function bearerToken(request: Request): string | null {
+  const match = request.headers.get("Authorization")?.trim().match(/^Bearer\s+(.*)$/i);
+  const token = match?.[1]?.trim();
+  return token ? token : null;
+}
+
+/**
+ * Resolve one request's credentials. With the OAuth adapter off this is the
+ * untouched native path (the bearer token is the caller's Honcho key). With
+ * it on, a JWT bearer is verified against the EDGAR auth server's JWKS and
+ * mapped server-side; anything that fails verification is a 401/403, never
+ * a silent fallback to the native key path.
+ */
+async function resolveRequestAuth(
+  request: Request,
+  env: Env,
+): Promise<RequestAuth | Response> {
+  let settings: OAuthSettings;
+  try {
+    settings = parseOAuthSettings();
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Invalid request";
+    return jsonResponse({ error: `OAuth adapter misconfigured: ${message}` }, 500);
+  }
+  const token = bearerToken(request);
+  if (!token) {
+    return unauthorized(
+      request,
+      "Missing Authorization header. Provide 'Authorization: Bearer <token>'.",
+    );
+  }
+
+  if (!settings.enabled) {
+    const config = configOrUnauthorized(request);
+    if (config instanceof Response) return config;
+    return { kind: "native", config, credential: token };
+  }
+
+  if (!looksLikeJwt(token)) {
+    if (!settings.allowNativeBearer) {
+      return unauthorized(
+        request,
+        "This server accepts OAuth access tokens only; a raw API key is not a valid credential here.",
+      );
+    }
+    const config = configOrUnauthorized(request);
+    if (config instanceof Response) return config;
+    return { kind: "native", config, credential: token };
+  }
+
+  try {
+    const identity = await verifyAccessToken(token, settings);
+    return {
+      kind: "oauth",
+      config: oauthHonchoConfig(
+        settings,
+        env.HONCHO_API_URL?.trim() || "https://api.honcho.dev",
+      ),
+      identity,
+      credential: token,
+    };
+  } catch (e) {
+    const resourceMetadata = `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
+    if (e instanceof OAuthError && e.kind === "invalid_token") {
+      // RFC 6750 §3 + RFC 9728 §5.1: invalid_token tells the client to
+      // refresh rather than re-authenticate from scratch.
+      return jsonResponse(
+        { error: "invalid_token", error_description: e.message },
+        401,
+        {
+          "WWW-Authenticate": `Bearer error="invalid_token", error_description="${e.message}", resource_metadata="${resourceMetadata}"`,
+        },
+      );
+    }
+    if (e instanceof OAuthError) {
+      // insufficient_scope / forbidden: authenticated, but not allowed.
+      return jsonResponse({ error: e.kind, error_description: e.message }, 403, {
+        "WWW-Authenticate": `Bearer error="${e.kind}" resource_metadata="${resourceMetadata}"`,
+      });
+    }
+    throw e;
+  }
+}
+
 function rejectedToken(request: Request): Response {
   const resourceMetadata = `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
   return invalidTokenResponse(resourceMetadata, CORS_HEADERS);
@@ -162,9 +280,9 @@ async function handleMcp(request: Request): Promise<Response> {
   if (sessionId) {
     const existing = sessions.get(sessionId);
     if (existing) {
-      const config = configOrUnauthorized(request);
-      if (config instanceof Response) return config;
-      if (config.apiKey !== existing.apiKey) {
+      const auth = await resolveRequestAuth(request, envBindings());
+      if (auth instanceof Response) return auth;
+      if (auth.credential !== existing.credential) {
         return unauthorized(
           request,
           "Authorization does not match this session.",
@@ -259,25 +377,28 @@ async function handleMcp(request: Request): Promise<Response> {
     );
   }
 
-  const config = configOrUnauthorized(request);
-  if (config instanceof Response) return config;
+  const auth = await resolveRequestAuth(request, envBindings());
+  if (auth instanceof Response) return auth;
 
-  const auth = { rejected: false };
-  const ctx: ToolContext = {
-    config,
-    ...honchoClients(
-      config,
-      identityHeaders(
-        request.headers.get("User-Agent"),
-        request.headers.get(HEADER_PLUGIN),
-      ),
-    ),
-    onUnauthorized: () => {
-      auth.rejected = true;
-      const mine = requestAuth.getStore();
-      if (mine) mine.rejected = true;
-    },
+  const rejected = { rejected: false };
+  const headers = identityHeaders(
+    request.headers.get("User-Agent"),
+    request.headers.get(HEADER_PLUGIN),
+  );
+  const onUnauthorized = () => {
+    rejected.rejected = true;
+    const mine = requestAuth.getStore();
+    if (mine) mine.rejected = true;
   };
+  const base: ToolContext = {
+    config: auth.config,
+    ...honchoClients(auth.config, headers),
+    onUnauthorized,
+  };
+  // OAuth sessions run inside the token's server-side grant: workspace and
+  // peer scope are enforced on every tool call, not just at initialize.
+  const ctx: ToolContext =
+    auth.kind === "oauth" ? guardToolContext(base, auth.identity) : base;
   const server = createServer(ctx);
 
   const maxSessions = envInt("MCP_SESSION_MAX", DEFAULT_SESSION_MAX);
@@ -305,8 +426,9 @@ async function handleMcp(request: Request): Promise<Response> {
         transport,
         server,
         lastSeen: Date.now(),
-        apiKey: config.apiKey,
-        auth,
+        apiKey: auth.config.apiKey,
+        credential: auth.credential,
+        auth: rejected,
         inFlight: 0,
       });
     },

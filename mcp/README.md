@@ -122,6 +122,38 @@ A platform start command is `bun src/http.ts` (or `bun run http` from `mcp/`).
 This repo does not ship a `vercel.json`; serverless replicas do not share the
 in-memory session map.
 
+### Opt-in OAuth access tokens (EDG-15 stage)
+
+By default the bearer token is the caller's own Honcho API key, unchanged.
+Operators can instead front the server with an OAuth 2.1 authorization
+server: callers present an RS256 access token, the server verifies it
+against the issuer's JWKS (signature, `iss`, `aud`, `exp`, `nbf`, scope),
+and maps the token's `(client_id, sub)` server-side to the Honcho
+workspace(s) — and optionally the observer peer — it may touch. The
+backend Honcho key (`HONCHO_API_KEY`) stays server-side and is never sent
+to clients; self-declared `workspace_id`/`peer_id` arguments can only pick
+among the mapped grant, never widen it, and the check runs on every tool
+call, not just at initialize.
+
+```bash
+MCP_OAUTH_ENABLED=1 \
+MCP_OAUTH_ISSUER=https://auth.example \
+MCP_OAUTH_AUDIENCE=https://mcp.example/mcp \
+MCP_OAUTH_JWKS_URL=https://auth.example/jwks.json \
+MCP_OAUTH_REQUIRED_SCOPE=mcp \
+MCP_OAUTH_MAPPING='{"mappings":[{"client_id":"c","sub":"s","workspace_id":"w","peer_id":"p"}]}' \
+HONCHO_API_KEY=<server-side honcho key> \
+bun run http
+```
+
+Without `MCP_OAUTH_ENABLED` nothing changes: the native
+`Authorization: Bearer <honcho-key>` path is byte-for-byte what it was.
+While the adapter is on, non-JWT bearers are refused unless
+`MCP_OAUTH_ALLOW_NATIVE_BEARER=1` explicitly keeps the native path open
+for them. `GET /.well-known/oauth-protected-resource` then advertises the
+OAuth issuer instead of the Honcho API URL. See `src/oauth.ts` and
+`src/oauth.test.ts` for the verification and fail-closed scoping rules.
+
 ### Docker
 
 ```bash
