@@ -136,6 +136,23 @@ function authorizationServer(): string {
 }
 
 /**
+ * The origin clients actually used to reach us. Behind the Cloudflare tunnel
+ * TLS is terminated at the edge, so the worker sees plain http on the
+ * loopback origin; the public scheme/host come from the standard forwarding
+ * headers. Without them (direct loopback probes, tests) the request URL is
+ * the truthful answer. Advertising an http:// challenge URL on a public
+ * https endpoint breaks RFC 9728 §5.1 discovery for strict clients.
+ */
+function publicOrigin(request: Request): string {
+  const url = new URL(request.url);
+  const proto = request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const host = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+  if (proto !== "https" && proto !== "http") return url.origin;
+  const hostname = host || url.host;
+  return `${proto}://${hostname}`;
+}
+
+/**
  * The canonical resource identifier this server protects: the MCP endpoint
  * URI itself. With the OAuth adapter on it is the configured audience — the
  * exact string the AS stamps into the token's `aud` and `verifyAccessToken`
@@ -151,12 +168,12 @@ function resourceIdentifier(request: Request): string {
   } catch {
     // Misconfigured adapter: fall through to the endpoint URI below.
   }
-  return `${new URL(request.url).origin}${MCP_RESOURCE_SUFFIX}`;
+  return `${publicOrigin(request)}${MCP_RESOURCE_SUFFIX}`;
 }
 
 /** RFC 9728 §5.1 challenge URL naming the metadata document for the resource. */
 function resourceMetadataUrl(request: Request): string {
-  return `${new URL(request.url).origin}${PROTECTED_RESOURCE_MCP_PATH}`;
+  return `${publicOrigin(request)}${PROTECTED_RESOURCE_MCP_PATH}`;
 }
 
 function protectedResourceMetadata(request: Request): Record<string, unknown> {

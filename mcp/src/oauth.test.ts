@@ -608,3 +608,30 @@ test("a 401 challenge on /mcp points resource_metadata at the path-aware URL", a
     `resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
   );
 });
+
+test("behind TLS termination the challenge and disabled-mode resource use the forwarded https origin", async () => {
+  // The public endpoint is reached through the Cloudflare tunnel, which
+  // terminates TLS: the worker sees http on the loopback origin and must
+  // advertise the client-visible https origin, or RFC 9728 §5.1 discovery
+  // hands strict clients an http:// metadata URL on an https resource.
+  const forwarded = {
+    "X-Forwarded-Proto": "https",
+    "X-Forwarded-Host": "honcho.edgars.tools",
+  };
+  setEnv(oauthEnv());
+  const res = await mcpPost({ ...forwarded }, initializeBody);
+  expect(res.status).toBe(401);
+  expect(res.headers.get("WWW-Authenticate") ?? "").toContain(
+    'resource_metadata="https://honcho.edgars.tools/.well-known/oauth-protected-resource/mcp"',
+  );
+
+  setEnv({});
+  const prm = await fetch(
+    new Request(`${origin}/.well-known/oauth-protected-resource/mcp`, {
+      headers: forwarded,
+    }),
+  );
+  expect(prm.status).toBe(200);
+  const body = (await prm.json()) as { resource: string };
+  expect(body.resource).toBe("https://honcho.edgars.tools/mcp");
+});
