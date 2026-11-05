@@ -1,0 +1,41 @@
+{
+  "date": "2026-11-06 Asia/Taipei",
+  "verdict": "PUBLIC_SERVER_READY_OWNER_CHATGPT_CONSENT_PENDING",
+  "mcp_source": "95fc78649a0d1f562e6fe69a623b3b47ed70187a",
+  "mcp_image": "edgar-memory-mcp:32d8adf-audit-xfp",
+  "mcp_endpoint": "https://honcho.edgars.tools/mcp",
+  "issuer": "https://auth.edgars.tools",
+  "native_origin": "https://auth-native.edgars.tools",
+  "native_as": "user systemd edgar-native-auth.service 127.0.0.1:18334",
+  "auth_router": {
+    "source_repo": "edgarstool/edgarstool-universal-auth-ui",
+    "source_commit": "d93759e2d09f824c976a4626e8145b480a2e641e",
+    "worker": "edgar-memory-auth-router",
+    "version": "990c5fe4-1d39-44db-a708-7c4b8ef91b2a",
+    "prefix_routes": 11,
+    "existing_auth_worker": "edgarstools-identity",
+    "full_auth_route": "UNCHANGED",
+    "ui_assets_title_fingerprint": "UNCHANGED"
+  },
+  "effective_policy": {
+    "MCP_OAUTH_REQUIRED_SCOPE": "mcp:read",
+    "coarse_only_token": "DENIED",
+    "read_only_mutation": "DENIED",
+    "revoked_token": "401",
+    "raw_native_bearer": "401"
+  },
+  "verification": {
+    "worker_suite": "150/150 PASS + tsc/lint/build/37-file source manifest",
+    "mcp_suite": "Hermes76/76; controller32d8adf snapshot75/75",
+    "actual_isolated_db_e2e": "9/9 PASS retained",
+    "public_machine_checks": "9/9 PASS after AS+MCP restart",
+    "public_login_bootstrap": "DCR201,authorize303,native login form200,secure CSRF cookie",
+    "human_login": "UNVERIFIED",
+    "chatgpt_actual_tool_call": "UNVERIFIED"
+  },
+  "evidence_jobs": [
+    "job_01M6PS570X00B6ZKE1YFPB2BDT",
+    "job_01M6PSEN9F00X5RQYCF5FWWNEZ",
+    "job_01M6PSHNK200RRZYKK2W4NSXKB"
+  ]
+}
