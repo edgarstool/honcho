@@ -53,6 +53,16 @@ const CORS_HEADERS: Record<string, string> = {
 };
 
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource";
+/**
+ * RFC 9728 §3.1 path-aware well-known URI for the canonical MCP endpoint:
+ * the well-known path is inserted between the origin and the resource path,
+ * so a client resolving https://honcho.edgars.tools/mcp asks for
+ * /.well-known/oauth-protected-resource/mcp first. Answering 404 there is
+ * what makes ChatGPT report「無法自動偵測 OAuth 設定」.
+ */
+const PROTECTED_RESOURCE_MCP_PATH = `${PROTECTED_RESOURCE_PATH}/mcp`;
+/** Path suffix of the canonical MCP endpoint inside the resource identifier. */
+const MCP_RESOURCE_SUFFIX = "/mcp";
 const MCP_PATHS = new Set(["/", "/mcp"]);
 
 type Session = {
@@ -123,6 +133,39 @@ function authorizationServer(): string {
     // Fall through to the Honcho-hosted default below.
   }
   return process.env.HONCHO_API_URL?.trim() || "https://api.honcho.dev";
+}
+
+/**
+ * The canonical resource identifier this server protects: the MCP endpoint
+ * URI itself. With the OAuth adapter on it is the configured audience — the
+ * exact string the AS stamps into the token's `aud` and `verifyAccessToken`
+ * compares against, so advertising the bare origin (or anything else) would
+ * make discovery point clients at a resource the verifier refuses. With the
+ * adapter off there is no configured audience; the endpoint's own URI is
+ * still the truthful identifier.
+ */
+function resourceIdentifier(request: Request): string {
+  try {
+    const settings = parseOAuthSettings();
+    if (settings.enabled) return settings.audience;
+  } catch {
+    // Misconfigured adapter: fall through to the endpoint URI below.
+  }
+  return `${new URL(request.url).origin}${MCP_RESOURCE_SUFFIX}`;
+}
+
+/** RFC 9728 §5.1 challenge URL naming the metadata document for the resource. */
+function resourceMetadataUrl(request: Request): string {
+  return `${new URL(request.url).origin}${PROTECTED_RESOURCE_MCP_PATH}`;
+}
+
+function protectedResourceMetadata(request: Request): Record<string, unknown> {
+  return {
+    resource: resourceIdentifier(request),
+    authorization_servers: [authorizationServer()],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["mcp", "mcp:read", "mcp:write"],
+  };
 }
 
 function withCors(response: Response): Response {
@@ -237,7 +280,7 @@ async function resolveRequestAuth(
       credential: token,
     };
   } catch (e) {
-    const resourceMetadata = `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
+    const resourceMetadata = resourceMetadataUrl(request);
     if (e instanceof OAuthError && e.kind === "invalid_token") {
       // RFC 6750 §3 + RFC 9728 §5.1: invalid_token tells the client to
       // refresh rather than re-authenticate from scratch.
@@ -260,17 +303,15 @@ async function resolveRequestAuth(
 }
 
 function rejectedToken(request: Request): Response {
-  const resourceMetadata = `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
-  return invalidTokenResponse(resourceMetadata, CORS_HEADERS);
+  return invalidTokenResponse(resourceMetadataUrl(request), CORS_HEADERS);
 }
 
 function unauthorized(request: Request, message: string): Response {
-  const resourceMetadata = `${new URL(request.url).origin}${PROTECTED_RESOURCE_PATH}`;
   return jsonResponse(
     { error: message },
     401,
     {
-      "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}"`,
+      "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadataUrl(request)}"`,
     },
   );
 }
@@ -466,16 +507,11 @@ export async function fetch(
     return jsonResponse({ status: "ok" }, 200);
   }
 
-  if (pathname === PROTECTED_RESOURCE_PATH) {
-    return jsonResponse(
-      {
-        resource: new URL(request.url).origin,
-        authorization_servers: [authorizationServer()],
-        bearer_methods_supported: ["header"],
-        scopes_supported: ["mcp", "mcp:read", "mcp:write"],
-      },
-      200,
-    );
+  if (
+    pathname === PROTECTED_RESOURCE_PATH ||
+    pathname === PROTECTED_RESOURCE_MCP_PATH
+  ) {
+    return jsonResponse(protectedResourceMetadata(request), 200);
   }
 
   if (!MCP_PATHS.has(pathname)) {

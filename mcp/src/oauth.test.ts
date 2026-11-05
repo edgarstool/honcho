@@ -533,3 +533,78 @@ test("protected resource metadata points at the EDGAR auth server when enabled",
   const body = (await res.json()) as { authorization_servers: string[] };
   expect(body.authorization_servers).toEqual([ISSUER]);
 });
+
+// ── RFC 9728 path-aware discovery (EDG-15 release) ──────────────────────
+// ChatGPT resolves the MCP server at https://honcho.edgars.tools/mcp, so it
+// asks for the path-aware well-known URL first. A 404 there is exactly the
+// live iOS failure「無法自動偵測 OAuth 設定」.
+test("path-aware /.well-known/oauth-protected-resource/mcp answers 200 with the configured audience as resource", async () => {
+  setEnv(oauthEnv());
+  stubNetwork();
+  const res = await fetch(
+    new Request(`${origin}/.well-known/oauth-protected-resource/mcp`),
+  );
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as {
+    resource: string;
+    authorization_servers: string[];
+    bearer_methods_supported: string[];
+    scopes_supported: string[];
+  };
+  // The advertised resource identifier MUST be the exact string the AS
+  // stamps into the token's aud and verifyAccessToken() compares against.
+  // The origin without the /mcp path does not match MCP_OAUTH_AUDIENCE.
+  expect(body.resource).toBe(AUDIENCE);
+  expect(body.authorization_servers).toEqual([ISSUER]);
+  expect(body.bearer_methods_supported).toEqual(["header"]);
+  expect(body.scopes_supported).toContain("mcp:read");
+  expect(body.scopes_supported).toContain("mcp:write");
+});
+
+test("the root metadata document advertises the same canonical resource", async () => {
+  setEnv(oauthEnv());
+  const pathAware = await fetch(
+    new Request(`${origin}/.well-known/oauth-protected-resource/mcp`),
+  );
+  const root = await fetch(
+    new Request(`${origin}/.well-known/oauth-protected-resource`),
+  );
+  expect(root.status).toBe(200);
+  const body = (await root.json()) as { resource: string };
+  expect(body.resource).toBe(AUDIENCE);
+  expect(body.resource).toBe((await (await pathAware).json() as { resource: string }).resource);
+});
+
+test("OAuth disabled: metadata keeps the canonical /mcp resource and does not advertise the EDGAR AS", async () => {
+  setEnv({});
+  const res = await fetch(
+    new Request(`${origin}/.well-known/oauth-protected-resource/mcp`),
+  );
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as {
+    resource: string;
+    authorization_servers: string[];
+  };
+  expect(body.resource).toBe(`${origin}/mcp`);
+  // Defensive rule: with the adapter off the server takes raw Honcho keys,
+  // so discovery must not point clients at the self-hosted EDGAR AS.
+  expect(body.authorization_servers).not.toContain(ISSUER);
+});
+
+test("unknown protected-resource suffixes are 404, not wildcard matches", async () => {
+  setEnv(oauthEnv());
+  const res = await fetch(
+    new Request(`${origin}/.well-known/oauth-protected-resource/some/other/path`),
+  );
+  expect(res.status).toBe(404);
+});
+
+test("a 401 challenge on /mcp points resource_metadata at the path-aware URL", async () => {
+  setEnv(oauthEnv());
+  const res = await mcpPost({}, initializeBody); // no bearer token
+  expect(res.status).toBe(401);
+  const challenge = res.headers.get("WWW-Authenticate") ?? "";
+  expect(challenge).toContain(
+    `resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+  );
+});
