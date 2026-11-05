@@ -1,0 +1,17 @@
+{
+  "date": "2026-11-06 Asia/Taipei",
+  "scope": "isolated actual EDGAR AS HTTPS + official native MCP HTTP + Honcho API 3.0.12 + PostgreSQL15 pgvector; no production credentials or data; no LLM/embedding validation",
+  "checks": {
+    "DCR": true,
+    "PKCE_LOGIN_CONSENT_TOKEN": true,
+    "MCP_INITIALIZE": true,
+    "READ_TOOL_FILTER": true,
+    "REAL_HONCHO_WRITE": true,
+    "REAL_HONCHO_READ": true,
+    "READ_WRITE_DENY": true,
+    "CROSS_WORKSPACE_DENY": true,
+    "REVOKED_TOKEN_401": true
+  },
+  "production_oauth": "UNVERIFIED",
+  "tokenizer_image": "sha256:cbb6b0a8069b8b440f5149d81097e6004fbf47e2341380f7524c0c34fbe51c7b"
+}
