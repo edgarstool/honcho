@@ -146,6 +146,42 @@ HONCHO_API_KEY=<server-side honcho key> \
 bun run http
 ```
 
+**Revocation.** A signed, unexpired token can still have been revoked,
+and JWKS verification cannot see that. Point the adapter at the
+authorization server's RFC 7662 introspection endpoint and it asks about
+the presented token on every request — there is no positive-result
+cache, and a timeout, a non-200, or a reply that disagrees with the
+token's own claims fails closed as `401 invalid_token`:
+
+```bash
+MCP_OAUTH_INTROSPECT_URL=https://auth.example/introspect \
+MCP_OAUTH_INTROSPECT_CLIENT_ID=<confidential client id> \
+MCP_OAUTH_INTROSPECT_CLIENT_SECRET=<confidential client secret> \
+```
+
+The endpoint must be `https://` (the request carries client credentials
+in an HTTP Basic header). Configuring the URL without credentials, or
+over plain HTTP, is a startup-time configuration error, not a silent
+downgrade. Without the URL the adapter keeps JWKS-only verification,
+which does not see revocation.
+
+**Per-tool scopes.** The base `MCP_OAUTH_REQUIRED_SCOPE` (default `mcp`)
+gates entry. On top of it, `mcp:read` narrows a token to read-only tools
+and `mcp:write` grants mutations: a token carrying `mcp:read` without
+`mcp:write` does not see mutating tools in `tools/list`, and a direct
+`tools/call` to one is refused server-side. A token carrying only the
+coarse `mcp` scope keeps full access, so tokens issued before the
+fine-grained scopes existed behave as before. Unknown tool names are
+denied by default.
+
+**Single-peer mappings.** When a mapping pins `peer_id`, the grant is
+per-peer: workspace-wide tools (`list_sessions`, `list_peers`,
+`inspect_workspace`, `search`, `workspace_chat`, the scope tools, and
+workspace-wide conclusion fetches) are unavailable, and session content,
+membership, and destructive ops require the mapped peer to actually take
+part in that session — checked against the live member list. Drop
+`peer_id` from the mapping for a workspace-wide grant.
+
 Without `MCP_OAUTH_ENABLED` nothing changes: the native
 `Authorization: Bearer <honcho-key>` path is byte-for-byte what it was.
 While the adapter is on, non-JWT bearers are refused unless

@@ -17,6 +17,7 @@ import {
   oauthHonchoConfig,
   OAuthError,
   parseOAuthSettings,
+  toolAllowed,
   verifyAccessToken,
   type OAuthIdentity,
   type OAuthSettings,
@@ -396,10 +397,17 @@ async function handleMcp(request: Request): Promise<Response> {
     onUnauthorized,
   };
   // OAuth sessions run inside the token's server-side grant: workspace and
-  // peer scope are enforced on every tool call, not just at initialize.
-  const ctx: ToolContext =
-    auth.kind === "oauth" ? guardToolContext(base, auth.identity) : base;
-  const server = createServer(ctx);
+  // peer scope are enforced on every tool call, and the tool set itself is
+  // filtered per identity (mcp:read vs mcp:write, workspace-wide tools for
+  // single-peer mappings), not just at initialize.
+  const identity = auth.kind === "oauth" ? auth.identity : undefined;
+  const ctx: ToolContext = identity ? guardToolContext(base, identity) : base;
+  const server = createServer(
+    ctx,
+    identity
+      ? { allows: (name, tool) => toolAllowed(name, tool.readOnly, identity) }
+      : undefined,
+  );
 
   const maxSessions = envInt("MCP_SESSION_MAX", DEFAULT_SESSION_MAX);
   if (sessions.size >= maxSessions) {
@@ -464,7 +472,7 @@ export async function fetch(
         resource: new URL(request.url).origin,
         authorization_servers: [authorizationServer()],
         bearer_methods_supported: ["header"],
-        scopes_supported: ["read", "write"],
+        scopes_supported: ["mcp", "mcp:read", "mcp:write"],
       },
       200,
     );

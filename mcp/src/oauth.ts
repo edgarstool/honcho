@@ -43,6 +43,19 @@ export interface OAuthSettings {
   serverApiKey: string;
   /** When true, non-JWT bearers fall through to the native key path. */
   allowNativeBearer: boolean;
+  /**
+   * RFC 7662 introspection endpoint of the authorization server. When set,
+   * every request asks the AS whether THIS token is still active — a
+   * correctly signed, unexpired token is still refused with 401 once the
+   * AS reports it inactive (revoked). Empty leaves JWKS-only verification,
+   * which structurally cannot see revocation.
+   */
+  introspectUrl: string;
+  /** Confidential client credentials for the introspection call (HTTP Basic). */
+  introspectClientId: string;
+  introspectClientSecret: string;
+  /** Per-request cap on the introspection round trip. */
+  introspectTimeoutMs: number;
 }
 
 export interface OAuthIdentity {
@@ -68,9 +81,18 @@ interface Mapping {
 const DEFAULT_REQUIRED_SCOPE = "mcp";
 const JWKS_TTL_MS = 10 * 60 * 1000;
 const JWKS_TIMEOUT_MS = 5_000;
+const INTROSPECT_TIMEOUT_MS = 5_000;
+/** Fine-grained scopes: `mcp:read` narrows a token to reads, `mcp:write` grants mutations. */
+const READ_SCOPE = "mcp:read";
+const WRITE_SCOPE = "mcp:write";
 
 function truthy(value: string | undefined): boolean {
   return value === "1" || value?.toLowerCase() === "true";
+}
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
 /**
@@ -90,6 +112,13 @@ export function parseOAuthSettings(
     mappingJson: env.MCP_OAUTH_MAPPING?.trim() ?? "",
     serverApiKey: env.HONCHO_API_KEY?.trim() ?? "",
     allowNativeBearer: truthy(env.MCP_OAUTH_ALLOW_NATIVE_BEARER),
+    introspectUrl: env.MCP_OAUTH_INTROSPECT_URL?.trim() ?? "",
+    introspectClientId: env.MCP_OAUTH_INTROSPECT_CLIENT_ID?.trim() ?? "",
+    introspectClientSecret: env.MCP_OAUTH_INTROSPECT_CLIENT_SECRET?.trim() ?? "",
+    introspectTimeoutMs: positiveInt(
+      env.MCP_OAUTH_INTROSPECT_TIMEOUT_MS,
+      INTROSPECT_TIMEOUT_MS,
+    ),
   };
   if (!settings.enabled) return settings;
   const missing = (["issuer", "audience", "jwksUrl", "mappingJson", "serverApiKey"] as const)
@@ -98,6 +127,29 @@ export function parseOAuthSettings(
     throw new Error(
       `OAuth adapter enabled but missing configuration: ${missing.join(", ")}`,
     );
+  }
+  if (settings.introspectUrl) {
+    // Revocation interrogation is a confidential-client call: without
+    // credentials, or over plain HTTP, the endpoint is unusable — and a
+    // silently skipped check is exactly the gap this stage closes.
+    if (!settings.introspectClientId || !settings.introspectClientSecret) {
+      throw new Error(
+        "MCP_OAUTH_INTROSPECT_URL requires MCP_OAUTH_INTROSPECT_CLIENT_ID and MCP_OAUTH_INTROSPECT_CLIENT_SECRET (confidential client)",
+      );
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(settings.introspectUrl);
+    } catch {
+      throw new Error(
+        `MCP_OAUTH_INTROSPECT_URL is not a valid URL: ${settings.introspectUrl}`,
+      );
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error(
+        "MCP_OAUTH_INTROSPECT_URL must use https:// — the introspection request carries client credentials",
+      );
+    }
   }
   return settings;
 }
@@ -181,6 +233,125 @@ function claimsIncludeAudience(aud: unknown, audience: string): boolean {
   if (typeof aud === "string") return aud === audience;
   if (Array.isArray(aud)) return aud.includes(audience);
   return false;
+}
+
+// ── revocation: RFC 7662 introspection ────────────────────────────────
+function basicAuth(clientId: string, clientSecret: string): string {
+  const bytes = new TextEncoder().encode(`${clientId}:${clientSecret}`);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `Basic ${btoa(binary)}`;
+}
+
+/**
+ * Ask the authorization server whether this exact token is still active
+ * (RFC 7662). Fail-closed: a timeout, an unreachable endpoint, a non-200,
+ * or a reply that is not the expected JSON shape is invalid_token — none
+ * of those is a grant.
+ */
+async function introspectToken(
+  token: string,
+  settings: OAuthSettings,
+  fetchImpl: typeof fetch,
+): Promise<Record<string, unknown>> {
+  let response: Response;
+  try {
+    response = await fetchImpl(settings.introspectUrl, {
+      method: "POST",
+      headers: {
+        Authorization: basicAuth(
+          settings.introspectClientId,
+          settings.introspectClientSecret,
+        ),
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body: new URLSearchParams({
+        token,
+        token_type_hint: "access_token",
+      }).toString(),
+      signal: AbortSignal.timeout(settings.introspectTimeoutMs),
+    });
+  } catch {
+    throw new OAuthError(
+      "invalid_token",
+      "token introspection failed (endpoint unreachable or timed out)",
+    );
+  }
+  if (!response.ok) {
+    throw new OAuthError(
+      "invalid_token",
+      `token introspection returned ${response.status}`,
+    );
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new OAuthError("invalid_token", "token introspection reply is not JSON");
+  }
+  if (typeof body !== "object" || body === null) {
+    throw new OAuthError(
+      "invalid_token",
+      "token introspection reply is not an object",
+    );
+  }
+  return body as Record<string, unknown>;
+}
+
+/**
+ * Crosscheck the AS's introspection reply against the verified token's own
+ * claims. An AS that reports "active" for a different subject, or whose
+ * view of exp/scope has drifted from the signed token, is not evidence
+ * that THIS token is good. Optional RFC 7662 fields are skipped when the
+ * AS omits them; present ones must agree.
+ */
+function crosscheckIntrospection(
+  settings: OAuthSettings,
+  claims: Record<string, unknown>,
+  introspected: Record<string, unknown>,
+): void {
+  const disagree = (field: string): never => {
+    throw new OAuthError(
+      "invalid_token",
+      `introspection reply disagrees with the token on '${field}'`,
+    );
+  };
+  if (introspected["sub"] !== claims["sub"]) disagree("sub");
+  if (introspected["client_id"] !== claims["client_id"]) disagree("client_id");
+  if (
+    introspected["iss"] !== undefined &&
+    introspected["iss"] !== settings.issuer
+  ) {
+    disagree("iss");
+  }
+  if (
+    introspected["aud"] !== undefined &&
+    !claimsIncludeAudience(introspected["aud"], settings.audience)
+  ) {
+    disagree("aud");
+  }
+  const exp = introspected["exp"];
+  if (exp !== undefined && (typeof exp !== "number" || exp !== claims["exp"])) {
+    disagree("exp");
+  }
+  const iat = introspected["iat"];
+  if (iat !== undefined && (typeof iat !== "number" || iat !== claims["iat"])) {
+    disagree("iat");
+  }
+  const scope = introspected["scope"];
+  if (scope !== undefined) {
+    if (typeof scope !== "string") {
+      throw new OAuthError(
+        "invalid_token",
+        "introspection reply disagrees with the token on 'scope'",
+      );
+    }
+    const granted = scope.split(/\s+/).filter(Boolean);
+    const carried = String(claims["scope"] ?? "").split(/\s+/).filter(Boolean);
+    if (!granted.includes(settings.requiredScope)) disagree("scope");
+    if (!carried.every((s) => granted.includes(s))) disagree("scope");
+  }
 }
 
 function parseMappings(mappingJson: string): Mapping[] {
@@ -318,6 +489,23 @@ export async function verifyAccessToken(
     throw new OAuthError("invalid_token", "token not yet valid");
   }
 
+  // Revocation is not a claim: a correctly signed, unexpired token can
+  // still have been revoked at the AS. When an introspection endpoint is
+  // configured it is asked about THIS token on every verification — no
+  // positive result is cached, because "active" a minute ago is not
+  // "active" now. Anything but an unambiguous, agreeing "active" fails
+  // closed as invalid_token.
+  if (settings.introspectUrl) {
+    const introspected = await introspectToken(token, settings, fetchImpl);
+    if (introspected["active"] !== true) {
+      throw new OAuthError(
+        "invalid_token",
+        "token is revoked or inactive at the authorization server",
+      );
+    }
+    crosscheckIntrospection(settings, claims, introspected);
+  }
+
   return resolveIdentity(settings, claims);
 }
 
@@ -405,9 +593,85 @@ function guardClient(client: Honcho, identity: OAuthIdentity): Honcho {
         return originalAddPeers(peers as never);
       }) as typeof session.addPeers;
     }
+    // A single-peer mapping is a per-peer grant: the session's content,
+    // membership and destructive ops are only available when the mapped
+    // peer actually takes part in it (checked against the live member
+    // list, never cached across sessions).
+    guardSessionForPeer(session as unknown as Mutable, identity.peerId!);
     return session;
   }) as typeof client.session;
   return client;
+}
+
+/**
+ * Pin one session object to `peerId`. Every read — and every destructive
+ * op — first checks, against the live member list, that the peer takes
+ * part in the session; content of an unrelated session is workspace-wide
+ * data the grant does not include. Fail-closed: a member list that cannot
+ * be read is not a grant. Applied once per session object.
+ */
+function guardSessionForPeer(session: Mutable, peerId: string): void {
+  const originalPeers = session["peers"];
+  if (typeof originalPeers !== "function") return;
+  const listPeers = (originalPeers as () => Promise<{ id: string }[]>).bind(session);
+
+  let membership: Promise<boolean> | null = null;
+  const isMember = (): Promise<boolean> => {
+    membership ??= listPeers()
+      .then((members) => members.some((member) => member.id === peerId))
+      .catch(() => false);
+    return membership;
+  };
+  const requireMember = async (what: string): Promise<void> => {
+    if (!(await isMember())) {
+      throw new OAuthError(
+        "forbidden",
+        `peer '${peerId}' is not a member of this session; ${what} is not available to it`,
+      );
+    }
+  };
+
+  const guard = (name: string, what: string): void => {
+    const original = session[name];
+    if (typeof original !== "function") return;
+    session[name] = async (...args: unknown[]) => {
+      await requireMember(what);
+      return (original as (...a: unknown[]) => Promise<unknown>).apply(session, args);
+    };
+  };
+
+  for (const name of [
+    "peers",
+    "messages",
+    "summaries",
+    "getMessage",
+    "getMetadata",
+    "setMetadata",
+    "delete",
+    "clone",
+    "removePeers",
+  ]) {
+    guard(name, "session data");
+  }
+
+  // Context can be asked for another peer's representation; that stays
+  // pinned to the mapped peer even when the session itself is shared.
+  const originalContext = session["context"];
+  if (typeof originalContext === "function") {
+    session["context"] = async (params: Mutable = {}) => {
+      await requireMember("session context");
+      for (const key of ["peerTarget", "peerPerspective"]) {
+        const value = params[key];
+        if (value !== undefined && value !== null && value !== peerId) {
+          throw new OAuthError(
+            "forbidden",
+            `peer '${String(value)}' is not permitted for this identity`,
+          );
+        }
+      }
+      return (originalContext as (p: unknown) => Promise<unknown>).call(session, params);
+    };
+  }
 }
 
 /**
@@ -443,11 +707,66 @@ function guardUnscoped(client: Honcho, identity: OAuthIdentity): Honcho {
   return client;
 }
 
+// ── per-tool authorization ────────────────────────────────────────────
+/**
+ * Tools whose result spans the whole workspace: they enumerate or
+ * aggregate across every peer and session in it. A mapping that pins a
+ * single peer is a per-peer grant, so these stay unavailable to it —
+ * listing, searching or aggregating workspace-wide data is not part of
+ * the grant. Scope membership is likewise a workspace-wide construct.
+ */
+const WORKSPACE_WIDE_TOOLS: ReadonlySet<string> = new Set([
+  "list_sessions",
+  "list_peers",
+  "inspect_workspace",
+  "search",
+  "workspace_chat",
+  "list_scopes",
+  "get_scope_sessions",
+  "get_scope_status",
+  "create_scope",
+  "add_sessions_to_scope",
+  "remove_session_from_scope",
+  "get_conclusions",
+  "get_derived_conclusions",
+]);
+
+/**
+ * Whether this identity may invoke mutating tools. The coarse `mcp` scope
+ * stays full access (backward compatible with tokens issued before the
+ * fine-grained scopes existed); the fine-grained `mcp:read` narrows a
+ * token to reads unless `mcp:write` is granted alongside it.
+ */
+export function identityMayWrite(identity: OAuthIdentity): boolean {
+  return (
+    identity.scopes.includes(WRITE_SCOPE) || !identity.scopes.includes(READ_SCOPE)
+  );
+}
+
+/**
+ * Per-tool allow decision for one OAuth identity. Reads need the base
+ * grant; mutations need `mcp:write`; workspace-wide tools need a
+ * workspace (not single-peer) mapping. A tool name that is not
+ * registered at all never reaches a handler — the server refuses it
+ * before this runs, so unknown tools are denied by default.
+ */
+export function toolAllowed(
+  name: string,
+  readOnly: boolean,
+  identity: OAuthIdentity,
+): boolean {
+  if (!readOnly && !identityMayWrite(identity)) return false;
+  if (identity.peerId && WORKSPACE_WIDE_TOOLS.has(name)) return false;
+  return true;
+}
+
 /**
  * Wrap the native tool context so every tool call runs inside the token's
  * server-side grant: the workspace comes from the mapping (a self-declared
- * workspace can only pick among permitted ones, never widen), and peer
- * operations are pinned when the mapping names a peer.
+ * workspace can only pick among permitted ones, never widen), peer
+ * operations are pinned when the mapping names a peer, and the tool set
+ * itself is filtered per identity (mcp:read vs mcp:write, workspace-wide
+ * tools for single-peer mappings).
  */
 export function guardToolContext(base: ToolContext, identity: OAuthIdentity): ToolContext {
   return {
